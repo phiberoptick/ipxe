@@ -24,10 +24,12 @@
 FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 FILE_SECBOOT ( PERMITTED );
 
+#include <byteswap.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <ipxe/asn1.h>
 #include <ipxe/crypto.h>
@@ -39,7 +41,7 @@ FILE_SECBOOT ( PERMITTED );
  *
  * RSA public-key cryptography
  *
- * RSA is documented in RFC 3447.
+ * RSA is documented in RFC 3447 and updated in RFC 8017.
  */
 
 /* Disambiguate the various error causes */
@@ -68,6 +70,8 @@ struct rsa_context {
 	bigint_element_t *output0;
 	/** Temporary working space for modular exponentiation */
 	void *tmp;
+	/** Modulus MSB mask */
+	uint8_t mask;
 };
 
 /**
@@ -76,12 +80,14 @@ struct rsa_context {
  * @v context		RSA context
  * @v digest		Digest algorithm
  * @v value		Digest value
+ * @v reference		Reference encoded digest (or NULL)
  * @v encoded		Encoded digest
  * @ret rc		Return status code
  */
 typedef int ( rsa_encode_t ) ( struct rsa_context *context,
 			       struct digest_algorithm *digest,
-			       const void *value, void *encoded );
+			       const void *value, const void *reference,
+			       void *encoded );
 
 /** Generate random data */
 int ( * rsa_get_random ) ( void *data, size_t len ) = get_random_nz;
@@ -243,6 +249,7 @@ static int rsa_init ( struct rsa_context *context,
 		      const struct asn1_cursor *key ) {
 	struct asn1_cursor modulus;
 	struct asn1_cursor exponent;
+	uint8_t msb;
 	int rc;
 
 	/* Initialise context */
@@ -260,6 +267,15 @@ static int rsa_init ( struct rsa_context *context,
 	DBGC ( context, "RSA %p exponent:\n", context );
 	DBGC_HDA ( context, 0, exponent.data, exponent.len );
 
+	/* Construct MSB mask */
+	msb = *( ( const uint8_t * ) modulus.data );
+	if ( ! msb ) {
+		DBGC ( context, "RSA %p invalid modulus MSB\n", context );
+		rc = -EINVAL;
+		goto err_msb;
+	}
+	context->mask = ( ( 1 << ( fls ( msb ) - 1 ) ) - 1 );
+
 	/* Allocate dynamic storage */
 	if ( ( rc = rsa_alloc ( context, modulus.len, exponent.len ) ) != 0 )
 		goto err_alloc;
@@ -274,6 +290,7 @@ static int rsa_init ( struct rsa_context *context,
 
 	rsa_free ( context );
  err_alloc:
+ err_msb:
  err_parse:
 	return rc;
 }
@@ -470,12 +487,15 @@ static int rsa_pkcs1_decrypt ( const struct asn1_cursor *key,
  * @v context		RSA context
  * @v digest		Digest algorithm
  * @v value		Digest value
+ * @v reference		Reference encoded digest (or NULL)
  * @v encoded		Encoded digest
  * @ret rc		Return status code
  */
 static int rsa_pkcs1_encode ( struct rsa_context *context,
 			      struct digest_algorithm *digest,
-			      const void *value, void *encoded ) {
+			      const void *value,
+			      const void *reference __unused,
+			      void *encoded ) {
 	struct rsa_digestinfo_prefix *prefix;
 	size_t digest_len = digest->digestsize;
 	uint8_t *temp = encoded;
@@ -524,6 +544,127 @@ static int rsa_pkcs1_encode ( struct rsa_context *context,
 }
 
 /**
+ * Apply RSA PSS mask generation function
+ *
+ * @v digest		Digest algorithm
+ * @v ctx		Digest context buffer
+ * @v out		Digest output buffer
+ * @v seed		Mask seed
+ * @v xor		XOR buffer
+ * @v len		Length of XOR buffer
+ */
+static void rsa_xor_mask ( struct digest_algorithm *digest, void *ctx,
+			   void *out, const void *seed, void *xor,
+			   size_t len ) {
+	size_t digest_len = digest->digestsize;
+	const uint8_t *out_byte = out;
+	uint8_t *xor_byte = xor;
+	uint32_t counter = 0;
+	unsigned int i;
+
+	while ( len ) {
+
+		/* Generate output */
+		digest_init ( digest, ctx );
+		digest_update ( digest, ctx, seed, digest_len );
+		digest_update ( digest, ctx, &counter, sizeof ( counter ) );
+		digest_final ( digest, ctx, out );
+
+		/* XOR output into buffer */
+		for ( i = 0 ; len && ( i < digest_len ) ; i++, len-- )
+			*(xor_byte++) ^= out_byte[i];
+
+		/* Increment counter */
+		counter = htonl ( ntohl ( counter ) + 1 );
+	}
+}
+
+/**
+ * Encode digest using RSA PSS
+ *
+ * @v context		RSA context
+ * @v digest		Digest algorithm
+ * @v value		Digest value
+ * @v reference		Reference encoded digest (or NULL)
+ * @v encoded		Encoded digest
+ * @ret rc		Return status code
+ */
+static int rsa_pss_encode ( struct rsa_context *context,
+			    struct digest_algorithm *digest,
+			    const void *value, const void *reference,
+			    void *encoded ) {
+	static uint8_t zero[8];
+	uint8_t ctx[ digest->ctxsize ];
+	uint8_t out[ digest->digestsize ];
+	size_t digest_len = digest->digestsize;
+	size_t mask_len;
+	size_t pad_len;
+	size_t min_len;
+	void *hash;
+	void *salt;
+	uint8_t *msb;
+	uint8_t *head;
+	uint8_t *tail;
+	int rc;
+
+	/* Sanity check */
+	min_len = ( sizeof ( *head ) + digest_len /* salt */ +
+		    digest_len /* hash */ + sizeof ( *tail ) );
+	if ( context->max_len < min_len ) {
+		DBGC ( context, "RSA %p %s formatted digest value too long "
+		       "(%zd bytes, max %zd)\n", context, digest->name,
+		       min_len, context->max_len );
+		return -ERANGE;
+	}
+	DBGC ( context, "RSA %p encoding %s digest using PSS:\n",
+	       context, digest->name );
+	DBGC_HDA ( context, 0, value, digest_len );
+
+	/* Split message into component parts */
+	pad_len = ( context->max_len - min_len );
+	msb = encoded;
+	head = ( msb + pad_len );
+	salt = ( head + sizeof ( *head ) );
+	hash = ( salt + digest_len );
+	tail = ( hash + digest_len );
+	mask_len = ( pad_len + sizeof ( *head ) + digest_len /* salt */ );
+	assert ( tail == ( encoded + context->max_len - 1 ) );
+
+	/* Generate or construct salt as applicable */
+	if ( reference ) {
+		memcpy ( encoded, reference, context->max_len );
+		rsa_xor_mask ( digest, ctx, out, hash, encoded, mask_len );
+	} else {
+		if ( ( rc = rsa_get_random ( salt, digest_len ) ) != 0 ) {
+			DBGC ( context, "RSA %p could not generate random "
+			       "salt: %s\n", context, strerror ( rc ) );
+			return rc;
+		}
+	}
+	DBGC ( context, "RSA %p salt:\n", context );
+	DBGC_HDA ( context, 0, salt, digest_len );
+
+	/* Construct intermediate digest */
+	digest_init ( digest, ctx );
+	digest_update ( digest, ctx, zero, sizeof ( zero ) );
+	digest_update ( digest, ctx, value, digest_len );
+	digest_update ( digest, ctx, salt, digest_len );
+	digest_final ( digest, ctx, hash );
+
+	/* Construct message */
+	memset ( encoded, 0, pad_len );
+	*head = 0x01;
+	rsa_xor_mask ( digest, ctx, out, hash, encoded, mask_len );
+	*msb &= context->mask;
+	*tail = 0xbc;
+	DBGC ( context, "RSA %p encoded %s digest using PSS:\n",
+	       context, digest->name );
+	DBGC_HDA ( context, 0, encoded, context->max_len );
+
+	return 0;
+}
+
+/**
  * Sign digest value using RSA
  *
  * @v key		Key
@@ -552,7 +693,8 @@ static int rsa_sign ( const struct asn1_cursor *key,
 		goto err_grow;
 
 	/* Encode digest */
-	if ( ( rc = encode ( &context, digest, value, signature->data ) ) != 0 )
+	if ( ( rc = encode ( &context, digest, value, NULL,
+			     signature->data ) ) != 0 )
 		goto err_encode;
 
 	/* Encipher the encoded digest */
@@ -624,7 +766,8 @@ static int rsa_verify ( const struct asn1_cursor *key,
 	 */
 	temp = context.output0;
 	actual = temp;
-	if ( ( rc = encode ( &context, digest, value, actual ) ) != 0 )
+	if ( ( rc = encode ( &context, digest, value, expected,
+			     actual ) ) != 0 )
 		goto err_encode;
 
 	/* Verify the signature */
@@ -683,6 +826,38 @@ static int rsa_pkcs1_verify ( const struct asn1_cursor *key,
 }
 
 /**
+ * Sign digest value using RSA PSS
+ *
+ * @v key		Key
+ * @v digest		Digest algorithm
+ * @v value		Digest value
+ * @v signature		Signature
+ * @ret rc		Return status code
+ */
+static int rsa_pss_sign ( const struct asn1_cursor *key,
+			  struct digest_algorithm *digest, const void *value,
+			  struct asn1_builder *signature ) {
+
+	return rsa_sign ( key, digest, value, signature, rsa_pss_encode );
+}
+
+/**
+ * Verify signed digest value using RSA PSS
+ *
+ * @v key		Key
+ * @v digest		Digest algorithm
+ * @v value		Digest value
+ * @v signature		Signature
+ * @ret rc		Return status code
+ */
+static int rsa_pss_verify ( const struct asn1_cursor *key,
+			    struct digest_algorithm *digest, const void *value,
+			    const struct asn1_cursor *signature ) {
+
+	return rsa_verify ( key, digest, value, signature, rsa_pss_encode );
+}
+
+/**
  * Check for matching RSA public/private key pair
  *
  * @v private_key	Private key
@@ -719,6 +894,16 @@ struct pubkey_algorithm rsa_algorithm = {
 	.decrypt	= rsa_pkcs1_decrypt,
 	.sign		= rsa_pkcs1_sign,
 	.verify		= rsa_pkcs1_verify,
+	.match		= rsa_match,
+};
+
+/** RSA-PSS public-key algorithm */
+struct pubkey_algorithm rsa_pss_algorithm = {
+	.name		= "rsa_pss",
+	.encrypt	= pubkey_null_encrypt,
+	.decrypt	= pubkey_null_decrypt,
+	.sign		= rsa_pss_sign,
+	.verify		= rsa_pss_verify,
 	.match		= rsa_match,
 };
 
