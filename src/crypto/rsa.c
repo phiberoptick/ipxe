@@ -70,6 +70,19 @@ struct rsa_context {
 	void *tmp;
 };
 
+/**
+ * Encode digest
+ *
+ * @v context		RSA context
+ * @v digest		Digest algorithm
+ * @v value		Digest value
+ * @v encoded		Encoded digest
+ * @ret rc		Return status code
+ */
+typedef int ( rsa_encode_t ) ( struct rsa_context *context,
+			       struct digest_algorithm *digest,
+			       const void *value, void *encoded );
+
 /** Generate random data */
 int ( * rsa_get_random ) ( void *data, size_t len ) = get_random_nz;
 
@@ -291,16 +304,16 @@ static void rsa_cipher ( struct rsa_context *context,
 }
 
 /**
- * Encrypt using RSA
+ * Encrypt using RSA PKCS#1
  *
  * @v key		Key
  * @v plaintext		Plaintext
  * @v ciphertext	Ciphertext
  * @ret ciphertext_len	Length of ciphertext, or negative error
  */
-static int rsa_encrypt ( const struct asn1_cursor *key,
-			 const struct asn1_cursor *plaintext,
-			 struct asn1_builder *ciphertext ) {
+static int rsa_pkcs1_encrypt ( const struct asn1_cursor *key,
+			       const struct asn1_cursor *plaintext,
+			       struct asn1_builder *ciphertext ) {
 	struct rsa_context context;
 	void *temp;
 	uint8_t *encoded;
@@ -368,16 +381,16 @@ static int rsa_encrypt ( const struct asn1_cursor *key,
 }
 
 /**
- * Decrypt using RSA
+ * Decrypt using RSA PKCS#1
  *
  * @v key		Key
  * @v ciphertext	Ciphertext
  * @v plaintext		Plaintext
  * @ret rc		Return status code
  */
-static int rsa_decrypt ( const struct asn1_cursor *key,
-			 const struct asn1_cursor *ciphertext,
-			 struct asn1_builder *plaintext ) {
+static int rsa_pkcs1_decrypt ( const struct asn1_cursor *key,
+			       const struct asn1_cursor *ciphertext,
+			       struct asn1_builder *plaintext ) {
 	struct rsa_context context;
 	void *temp;
 	uint8_t *encoded;
@@ -452,7 +465,7 @@ static int rsa_decrypt ( const struct asn1_cursor *key,
 }
 
 /**
- * Encode RSA digest
+ * Encode digest using RSA PKCS#1
  *
  * @v context		RSA context
  * @v digest		Digest algorithm
@@ -460,9 +473,9 @@ static int rsa_decrypt ( const struct asn1_cursor *key,
  * @v encoded		Encoded digest
  * @ret rc		Return status code
  */
-static int rsa_encode_digest ( struct rsa_context *context,
-			       struct digest_algorithm *digest,
-			       const void *value, void *encoded ) {
+static int rsa_pkcs1_encode ( struct rsa_context *context,
+			      struct digest_algorithm *digest,
+			      const void *value, void *encoded ) {
 	struct rsa_digestinfo_prefix *prefix;
 	size_t digest_len = digest->digestsize;
 	uint8_t *temp = encoded;
@@ -487,7 +500,7 @@ static int rsa_encode_digest ( struct rsa_context *context,
 		       max_len );
 		return -ERANGE;
 	}
-	DBGC ( context, "RSA %p encoding %s digest:\n",
+	DBGC ( context, "RSA %p encoding %s digest using PKCS#1:\n",
 	       context, digest->name );
 	DBGC_HDA ( context, 0, value, digest_len );
 
@@ -503,7 +516,8 @@ static int rsa_encode_digest ( struct rsa_context *context,
 	memcpy ( temp, value, digest_len );
 	temp += digest_len;
 	assert ( temp == ( encoded + context->max_len ) );
-	DBGC ( context, "RSA %p encoded %s digest:\n", context, digest->name );
+	DBGC ( context, "RSA %p encoded %s digest using PKCS#1:\n",
+	       context, digest->name );
 	DBGC_HDA ( context, 0, encoded, context->max_len );
 
 	return 0;
@@ -516,11 +530,12 @@ static int rsa_encode_digest ( struct rsa_context *context,
  * @v digest		Digest algorithm
  * @v value		Digest value
  * @v signature		Signature
+ * @v encode		Encoding method
  * @ret rc		Return status code
  */
 static int rsa_sign ( const struct asn1_cursor *key,
 		      struct digest_algorithm *digest, const void *value,
-		      struct asn1_builder *signature ) {
+		      struct asn1_builder *signature, rsa_encode_t *encode ) {
 	struct rsa_context context;
 	int rc;
 
@@ -537,8 +552,7 @@ static int rsa_sign ( const struct asn1_cursor *key,
 		goto err_grow;
 
 	/* Encode digest */
-	if ( ( rc = rsa_encode_digest ( &context, digest, value,
-					signature->data ) ) != 0 )
+	if ( ( rc = encode ( &context, digest, value, signature->data ) ) != 0 )
 		goto err_encode;
 
 	/* Encipher the encoded digest */
@@ -565,11 +579,13 @@ static int rsa_sign ( const struct asn1_cursor *key,
  * @v digest		Digest algorithm
  * @v value		Digest value
  * @v signature		Signature
+ * @v encoding		Encoding method
  * @ret rc		Return status code
  */
 static int rsa_verify ( const struct asn1_cursor *key,
 			struct digest_algorithm *digest, const void *value,
-			const struct asn1_cursor *signature ) {
+			const struct asn1_cursor *signature,
+			rsa_encode_t *encode ) {
 	struct rsa_context context;
 	void *temp;
 	void *expected;
@@ -608,8 +624,7 @@ static int rsa_verify ( const struct asn1_cursor *key,
 	 */
 	temp = context.output0;
 	actual = temp;
-	if ( ( rc = rsa_encode_digest ( &context, digest, value,
-					actual ) ) != 0 )
+	if ( ( rc = encode ( &context, digest, value, actual ) ) != 0 )
 		goto err_encode;
 
 	/* Verify the signature */
@@ -632,6 +647,39 @@ static int rsa_verify ( const struct asn1_cursor *key,
 	rsa_free ( &context );
  err_init:
 	return rc;
+}
+
+/**
+ * Sign digest value using RSA PKCS#1
+ *
+ * @v key		Key
+ * @v digest		Digest algorithm
+ * @v value		Digest value
+ * @v signature		Signature
+ * @ret rc		Return status code
+ */
+static int rsa_pkcs1_sign ( const struct asn1_cursor *key,
+			    struct digest_algorithm *digest, const void *value,
+			    struct asn1_builder *signature ) {
+
+	return rsa_sign ( key, digest, value, signature, rsa_pkcs1_encode );
+}
+
+/**
+ * Verify signed digest value using RSA PKCS#1
+ *
+ * @v key		Key
+ * @v digest		Digest algorithm
+ * @v value		Digest value
+ * @v signature		Signature
+ * @ret rc		Return status code
+ */
+static int rsa_pkcs1_verify ( const struct asn1_cursor *key,
+			      struct digest_algorithm *digest,
+			      const void *value,
+			      const struct asn1_cursor *signature ) {
+
+	return rsa_verify ( key, digest, value, signature, rsa_pkcs1_encode );
 }
 
 /**
@@ -667,10 +715,10 @@ static int rsa_match ( const struct asn1_cursor *private_key,
 /** RSA public-key algorithm */
 struct pubkey_algorithm rsa_algorithm = {
 	.name		= "rsa",
-	.encrypt	= rsa_encrypt,
-	.decrypt	= rsa_decrypt,
-	.sign		= rsa_sign,
-	.verify		= rsa_verify,
+	.encrypt	= rsa_pkcs1_encrypt,
+	.decrypt	= rsa_pkcs1_decrypt,
+	.sign		= rsa_pkcs1_sign,
+	.verify		= rsa_pkcs1_verify,
 	.match		= rsa_match,
 };
 
