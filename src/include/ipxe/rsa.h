@@ -58,4 +58,6 @@ struct rsa_digestinfo_prefix {
 
 extern struct pubkey_algorithm rsa_algorithm;
 
+extern int ( * rsa_get_random ) ( void *data, size_t len );
+
 #endif /* _IPXE_RSA_H */

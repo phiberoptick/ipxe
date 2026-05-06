@@ -70,6 +70,9 @@ struct rsa_context {
 	void *tmp;
 };
 
+/** Generate random data */
+int ( * rsa_get_random ) ( void *data, size_t len ) = get_random_nz;
+
 /**
  * Identify RSA prefix
  *
@@ -331,7 +334,7 @@ static int rsa_encrypt ( const struct asn1_cursor *key,
 	encoded = temp;
 	encoded[0] = 0x00;
 	encoded[1] = 0x02;
-	if ( ( rc = get_random_nz ( &encoded[2], random_nz_len ) ) != 0 ) {
+	if ( ( rc = rsa_get_random ( &encoded[2], random_nz_len ) ) != 0 ) {
 		DBGC ( &context, "RSA %p could not generate random data: %s\n",
 		       &context, strerror ( rc ) );
 		goto err_random;
@@ -339,6 +342,8 @@ static int rsa_encrypt ( const struct asn1_cursor *key,
 	encoded[ 2 + random_nz_len ] = 0x00;
 	memcpy ( &encoded[ context.max_len - plaintext->len ],
 		 plaintext->data, plaintext->len );
+	DBGC ( &context, "RSA %p encoded:\n", &context );
+	DBGC_HDA ( &context, 0, encoded, context.max_len );
 
 	/* Create space for ciphertext */
 	if ( ( rc = asn1_grow ( ciphertext, context.max_len ) ) != 0 )
@@ -404,6 +409,8 @@ static int rsa_decrypt ( const struct asn1_cursor *key,
 	temp = context.input0;
 	encoded = temp;
 	rsa_cipher ( &context, ciphertext->data, encoded );
+	DBGC ( &context, "RSA %p encoded:\n", &context );
+	DBGC_HDA ( &context, 0, encoded, context.max_len );
 
 	/* Parse the message */
 	end = ( encoded + context.max_len );
