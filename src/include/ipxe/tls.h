@@ -123,6 +123,12 @@ struct tls_header {
 #define TLS_ECDSA_SHA384_ALGORITHM 0x0503
 #define TLS_RSA_SHA512_ALGORITHM 0x0601
 #define TLS_ECDSA_SHA512_ALGORITHM 0x0603
+#define TLS_RSA_PSS_RSAE_SHA256_ALGORITHM 0x0804
+#define TLS_RSA_PSS_RSAE_SHA384_ALGORITHM 0x0805
+#define TLS_RSA_PSS_RSAE_SHA512_ALGORITHM 0x0806
+#define TLS_RSA_PSS_PSS_SHA256_ALGORITHM 0x0809
+#define TLS_RSA_PSS_PSS_SHA384_ALGORITHM 0x080a
+#define TLS_RSA_PSS_PSS_SHA512_ALGORITHM 0x080b
 
 /* TLS server name extension */
 #define TLS_SERVER_NAME 0
@@ -284,6 +290,8 @@ struct tls_signature_hash_algorithm {
 	struct digest_algorithm *digest;
 	/** Public-key algorithm */
 	struct pubkey_algorithm *pubkey;
+	/** Required certificate OID-identified algorithm */
+	struct asn1_algorithm *algorithm;
 	/** Numeric code (in network-endian order) */
 	uint16_t code;
 };
@@ -392,6 +400,8 @@ struct tls_server {
 	struct x509_root *root;
 	/** Certificate chain */
 	struct x509_chain *chain;
+	/** Public key algorithm (within server certificate) */
+	struct asn1_algorithm *algorithm;
 	/** Public key (within server certificate) */
 	struct asn1_cursor key;
 	/** Certificate validator */

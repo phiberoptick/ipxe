@@ -1463,10 +1463,9 @@ static int tls_verify_dh_params ( struct tls_connection *tls,
 		digest = sig_hash->digest;
 		DBGC ( tls, "TLS %p using signature hash %s-%s\n",
 		       tls, pubkey->name, digest->name );
-		if ( pubkey != cipherspec->suite->pubkey ) {
-			DBGC ( tls, "TLS %p ServerKeyExchange incorrect "
-			       "signature algorithm %s (expected %s)\n", tls,
-			       pubkey->name, cipherspec->suite->pubkey->name );
+		if ( sig_hash->algorithm != tls->server.algorithm ) {
+			DBGC ( tls, "TLS %p cannot use %s public key\n",
+			       tls, tls->server.algorithm->name );
 			return -EPERM_KEY_EXCHANGE;
 		}
 	} else {
@@ -2331,6 +2330,7 @@ static int tls_parse_chain ( struct tls_connection *tls,
 	memset ( &tls->server.key, 0, sizeof ( tls->server.key ) );
 	x509_chain_put ( tls->server.chain );
 	tls->server.chain = NULL;
+	tls->server.algorithm = NULL;
 
 	/* Create certificate chain */
 	tls->server.chain = x509_alloc_chain();
@@ -2391,6 +2391,7 @@ static int tls_parse_chain ( struct tls_connection *tls,
 	memset ( &tls->server.key, 0, sizeof ( tls->server.key ) );
 	x509_chain_put ( tls->server.chain );
 	tls->server.chain = NULL;
+	tls->server.algorithm = NULL;
  err_alloc_chain:
 	return rc;
 }
@@ -3685,6 +3686,7 @@ static void tls_validator_done ( struct tls_connection *tls, int rc ) {
 	}
 
 	/* Extract the now trusted server public key */
+	tls->server.algorithm = cert->subject.public_key.algorithm;
 	memcpy ( &tls->server.key, &cert->subject.public_key.raw,
 		 sizeof ( tls->server.key ) );
 
